@@ -16,6 +16,8 @@
 #include "common.h"
 #include "dumnet.h"
 
+// https://github.com/duxing2007/ldd3-examples-3.x/blob/origin/linux-4.9.y/snull/snull.c
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("amscw");
 
@@ -36,6 +38,7 @@ struct dumPacket_
 };
 
 struct dumPriv_ {
+	struct net_device *pDev;
 	struct net_device_stats stats;
 	int status;
 	struct dumPacket_ *pPool;			// pointer to last item in list
@@ -79,6 +82,7 @@ static const struct net_device_ops dummyNetdevOps = {
 };
 static const struct header_ops dummyHeaderOps = {
     .create  = dumHeader,
+    .cache = NULL,
 };
 static int timeout = DUMMY_NETDEV_TIMEOUT;
 static unsigned long transStart;
@@ -344,6 +348,14 @@ void dumSetup(struct net_device *pDev)
 	// The init function (sometimes called probe).
 	// It is invoked by register_netdev()
 	struct dumPriv_ *pPriv;
+
+	// Then, initialize the priv field. This encloses the statistics and a few private fields.
+	pPriv = netdev_priv(pDev);
+	memset(pPriv, 0, sizeof(struct dumPriv_));
+	spin_lock_init(&pPriv->lock);
+	pPriv->pDev = pDev;
+
+
 #if 0
     // Make the usual checks: check_region(), probe irq, ...  -ENODEV
 	// should be returned if no device found.  No resource should be
@@ -353,17 +365,14 @@ void dumSetup(struct net_device *pDev)
 	// Then, assign other fields in dev, using ether_setup() and some hand assignments
 	ether_setup(pDev);	// assign some of the fields
 	pDev->watchdog_timeo = timeout;
-	pDev->netdev_ops = &dummyNetdevOps;
-	pDev->header_ops = &dummyHeaderOps;
 	
 	// keep the default flags, just add NOARP
 	pDev->flags |= IFF_NOARP;
 	pDev->features |= NETIF_F_HW_CSUM;
-
-	// Then, initialize the priv field. This encloses the statistics and a few private fields.
-	pPriv = netdev_priv(pDev);
-	memset(pPriv, 0, sizeof(struct dumPriv_));
-	spin_lock_init(&pPriv->lock);
+	
+	pDev->netdev_ops = &dummyNetdevOps;
+	pDev->header_ops = &dummyHeaderOps;
+	
 	rxIntEn(pDev, 1);	// enable receive interrupts
 	createPool(pDev);
 }
@@ -451,7 +460,7 @@ static int dumTxPkt(struct sk_buff *pSkB, struct net_device *pDev)
 	// actual deliver of data is device-specific, and not shown here
 	txPktByHW(pData, len, pDev);
 
-	return 0;
+	return NETDEV_TX_OK;
 }
 
 static int dumIoctl(struct net_device *pDev, struct ifreq *pReq, int cmd)
@@ -525,7 +534,7 @@ static int dumHeader(struct sk_buff *pSkB, struct net_device *pDev, unsigned sho
  * Entry/exit point functions
  */
 
-static int __init dummyNetdevModuleInit(void)
+static int dummyNetdevModuleInit(void)
 {
 	int err = 0, i;
 
@@ -561,7 +570,7 @@ static int __init dummyNetdevModuleInit(void)
 	return 0;
 }
 
-static void __exit dummyNetdevModuleExit(void)
+static void dummyNetdevModuleExit(void)
 {	
 	dumCleanup();
 	PRINT_STATUS(0);
