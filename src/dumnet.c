@@ -6,7 +6,7 @@
 #include <linux/errno.h>		// error codes
 #include <linux/types.h>		// size_t
 #include <linux/in.h>
-#include <linux/netdevice.h>	// struct deivce and other headers
+#include <linux/netdevice.h>	// struct device and other headers
 #include <linux/etherdevice.h>	// eth_type_trans
 #include <linux/ip.h>			// struct iphdr
 #include <linux/tcp.h>			// struct tcphdr
@@ -17,6 +17,7 @@
 #include "dumnet.h"
 
 // https://github.com/duxing2007/ldd3-examples-3.x/blob/origin/linux-4.9.y/snull/snull.c
+// https://elixir.bootlin.com/linux/latest/source/net/core/dev.c#L9201 
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("amscw");
@@ -54,15 +55,15 @@ struct dumPriv_ {
 //-------------------------------------------------------------------------------------------------
 // Prototypes
 //-------------------------------------------------------------------------------------------------
-static int dumOpen(struct net_device *pDev); 
-static int dumClose(struct net_device *pDev);
-static int dumConfig(struct net_device *pDev, struct ifmap *pMap);
-static int dumTxPkt(struct sk_buff *pSkB, struct net_device *pDev);
-static int dumIoctl(struct net_device *pDev, struct ifreq *pReq, int cmd);
-static int dumChangeMTU(struct net_device *pDev, int newMTU);
-static void dumTxTimeout (struct net_device *pDev);
-static struct net_device_stats *dumStats(struct net_device *pDev);
-static int dumHeader(struct sk_buff *pSkB, struct net_device *pDev, unsigned short type, 
+int dumOpen(struct net_device *pDev); 
+int dumClose(struct net_device *pDev);
+int dumConfig(struct net_device *pDev, struct ifmap *pMap);
+int dumTxPkt(struct sk_buff *pSkB, struct net_device *pDev);
+int dumIoctl(struct net_device *pDev, struct ifreq *pReq, int cmd);
+int dumChangeMTU(struct net_device *pDev, int newMTU);
+void dumTxTimeout (struct net_device *pDev);
+struct net_device_stats *dumStats(struct net_device *pDev);
+int dumHeader(struct sk_buff *pSkB, struct net_device *pDev, unsigned short type, 
 	const void *pDAddr, const void *pSAddr, unsigned len);
 
 //-------------------------------------------------------------------------------------------------
@@ -179,14 +180,15 @@ static struct dumPacket_ *dequeuePkt(struct net_device *pDev)
 	struct dumPriv_ *pPriv = netdev_priv(pDev);
 	struct dumPacket_ *pPkt;
 	unsigned long flags = 0;
-	spin_lock_irqsave(&pPriv->lock, flags);
+
+	// spin_lock_irqsave(&pPriv->lock, flags);
 	pPkt = pPriv->pRxQueue;
 	if (pPkt != NULL)
 	{
 		pPriv->pRxQueue = pPkt->pNext;
 		pPkt->pNext = NULL;
 	}
-	spin_unlock_irqrestore(&pPriv->lock, flags);
+	// spin_unlock_irqrestore(&pPriv->lock, flags);
 	return pPkt;
 }
 
@@ -243,14 +245,7 @@ static void txPktByHW(char *pBuf, int len, struct net_device *pDev)
 		return;
 	}
 
-	if (1) { /* enable this conditional to look at the data */
-		int i;
-		PDEBUG("len is %i\n" KERN_DEBUG "data:", len);
-		for (i=14; i<len; i++)
-			printk(" %02x", pBuf[i]&0xff);
-		printk("\n");
-	}
-
+	
 	// Ethhdr is 14 bytes, but the kernel arranges for iphdr
 	pIP = (struct iphdr *)(pBuf + sizeof(struct ethhdr));
 	pSAddr = &pIP->saddr;
@@ -277,24 +272,30 @@ static void txPktByHW(char *pBuf, int len, struct net_device *pDev)
 	pDest = dummyDevs[pDev == dummyDevs[0] ? 1 : 0];
 	pPriv = netdev_priv(pDest);
 	pTxBuffer = getPkt(pDev);
-	pTxBuffer->datalen = len;
-	
-	// fake transmit packet
-	memcpy(pTxBuffer->data, pBuf, len);
+	if (pTxBuffer != NULL)
+	{
+		int i;
+		
+		pTxBuffer->datalen = len;
+	 	// fake transmit packet
+		memcpy(pTxBuffer->data, pBuf, len);
+		PDEBUG("hw tx packet by %s, len is %i", pDev->name, len);
+		
+	  	// fake receive packet
+		enqueuePkt(pDest, pTxBuffer);	
+		if (pPriv->bIsRxIntEnabled) 
+		{
+			pPriv->status |= DUMMY_NETDEV_RX_INTR;
+		 	dummyNetdevInterrupt(0, pDest, NULL);
+		}
 
-	// fake receive packet
-	enqueuePkt(pDest, pTxBuffer);	
-	if (pPriv->bIsRxIntEnabled) {
+		// terminate transmission
+		pPriv = netdev_priv(pDev);
+		pPriv->txPacketLen = len;
+		pPriv->pTxPacketData = pBuf;
 		pPriv->status |= DUMMY_NETDEV_TX_INTR;
-		dummyNetdevInterrupt(0, pDest, NULL);
+		dummyNetdevInterrupt(0, pDev, NULL);
 	}
-
-	// terminate transmission
-	pPriv = netdev_priv(pDev);
-	pPriv->txPacketLen = len;
-	pPriv->pTxPacketData = pBuf;
-	pPriv->status |= DUMMY_NETDEV_TX_INTR;
-	dummyNetdevInterrupt(0, pDev, NULL);
 }
 
 
@@ -316,23 +317,27 @@ static void regularIntHandler(int irq, void *pDevId, struct pt_regs *pRegs)
 	// Lock the device
 	pPriv = netdev_priv(pDev);
 	spin_lock(&pPriv->lock);
-
 	// retrieve statusword: real netdevices use I/O instructions
 	statusWord = pPriv->status;
-	pPriv->status = 0;
+	// pPriv->status = 0;
 	if (statusWord & DUMMY_NETDEV_RX_INTR) {
+		PDEBUG("rx interrupt occur at %s", pDev->name);
 		// send it to rxPkt for handling 
-		pPkt = pPriv->pRxQueue;
+		pPkt = dequeuePkt(pDev);
 		if (pPkt) {
-			pPriv->pRxQueue = pPkt->pNext;
+			PDEBUG("received new packet at %s, len %i", pDev->name, pPkt->datalen);
 			rxPkt(pDev, pPkt);
 		}
 	}
 	if (statusWord & DUMMY_NETDEV_TX_INTR) {
+		PDEBUG("tx interrupt occur at %s", pDev->name);
 		// a transmission is over: free the skb
 		pPriv->stats.tx_packets++;
 		pPriv->stats.tx_bytes += pPriv->txPacketLen;
 		dev_kfree_skb(pPriv->pSkB);
+		pPriv->pSkB = NULL;
+		statusWord &= ~DUMMY_NETDEV_TX_INTR;
+		pPriv->status = statusWord;
 	}
 
 	// Unlock the device and we are done
@@ -351,6 +356,8 @@ void dumSetup(struct net_device *pDev)
 
 	// Then, initialize the priv field. This encloses the statistics and a few private fields.
 	pPriv = netdev_priv(pDev);
+	PDEBUG("try to setup device 0x%p, pPriv=0x%p", pDev, pPriv);
+	
 	memset(pPriv, 0, sizeof(struct dumPriv_));
 	spin_lock_init(&pPriv->lock);
 	pPriv->pDev = pDev;
@@ -375,38 +382,43 @@ void dumSetup(struct net_device *pDev)
 	
 	rxIntEn(pDev, 1);	// enable receive interrupts
 	createPool(pDev);
+	PRINT_STATUS(0);
 }
 
 void dumCleanup(void)
 {
 	int i;
-    
-	for (i = 0; i < 2;  i++) {
-		if (dummyDevs[i]) {
-			unregister_netdev(dummyDevs[i]);
-			destroyPool(dummyDevs[i]);
-			free_netdev(dummyDevs[i]);
-		}
-	}
+	PRINT_STATUS(0);    
+	// for (i = 0; i < 2;  i++) {
+	// 	if (dummyDevs[i]) {
+	// 		unregister_netdev(dummyDevs[i]);
+	// 		destroyPool(dummyDevs[i]);
+	// 		free_netdev(dummyDevs[i]);
+	// 	}
+	// }
 }
 	
 /*
  * Net device operations
  */
 
-static int dumOpen(struct net_device *pDev) 
+int dumOpen(struct net_device *pDev) 
 {
 	// request_region(), request_irq(), ...
 
 	// Assign the hardware address
 	memcpy(pDev->dev_addr, "\0DUMM0", ETH_ALEN);
-	if (pDev == dummyDevs[1])
-		pDev->dev_addr[ETH_ALEN-1]++; // \0DUMM1
+	  if (pDev == dummyDevs[1])
+	 	pDev->dev_addr[ETH_ALEN-1]++; // \0DUMM1
+	PDEBUG("MAC address %02x:%02x:%02x:%02x:%02x:%02x assigned to %s", 
+		pDev->dev_addr[0], pDev->dev_addr[1], pDev->dev_addr[2], pDev->dev_addr[3], pDev->dev_addr[4], pDev->dev_addr[5],
+		pDev->name);
 	netif_start_queue(pDev);
+	PRINT_STATUS(0);
 	return 0;
 }
 
-static int dumClose(struct net_device *pDev)
+int dumClose(struct net_device *pDev)
 {
 	// release ports, irq and such...
 
@@ -414,10 +426,11 @@ static int dumClose(struct net_device *pDev)
 	return 0;	
 }
 
-static int dumConfig(struct net_device *pDev, struct ifmap *pMap)
+int dumConfig(struct net_device *pDev, struct ifmap *pMap)
 {
 	int err;
 
+	// PDEBUG("configure the device %s", pDev->name);
 	if (pDev->flags & IFF_UP)
 	{
 		// can't act on a running interface
@@ -437,10 +450,11 @@ static int dumConfig(struct net_device *pDev, struct ifmap *pMap)
 	}
 
 	// ignore other fields
+	PRINT_STATUS(0);
 	return 0;
 }
 
-static int dumTxPkt(struct sk_buff *pSkB, struct net_device *pDev)
+int dumTxPkt(struct sk_buff *pSkB, struct net_device *pDev)
 {
 	int len;
 	char *pData, shortpkt[ETH_ZLEN];
@@ -463,13 +477,13 @@ static int dumTxPkt(struct sk_buff *pSkB, struct net_device *pDev)
 	return NETDEV_TX_OK;
 }
 
-static int dumIoctl(struct net_device *pDev, struct ifreq *pReq, int cmd)
+int dumIoctl(struct net_device *pDev, struct ifreq *pReq, int cmd)
 {
-	PDEBUG("ioctl not implemeted\n");
+	// PRINT_STATUS_MSG("command 0x%04x not implemeted for %s", 0, cmd, pDev->name);
 	return 0;
 }
 
-static int dumChangeMTU(struct net_device *pDev, int newMTU)
+int dumChangeMTU(struct net_device *pDev, int newMTU)
 {
 	// The "change_mtu" method is usually not needed.
 	// If you need it, it must be like this.
@@ -480,6 +494,7 @@ static int dumChangeMTU(struct net_device *pDev, int newMTU)
     int err = 0;
 
 	// check ranges
+	// PDEBUG("set new MTU=%i to %s", newMTU, pDev->name);
 	if ((newMTU < 68) || (newMTU > 1500))
 	{
 		PRINT_STATUS_MSG("MTU is out if range (68, 1500): %i", (err=-EINVAL), newMTU);
@@ -490,10 +505,11 @@ static int dumChangeMTU(struct net_device *pDev, int newMTU)
 	spin_lock_irqsave(pLock, flags);
 	pDev->mtu = newMTU;
 	spin_unlock_irqrestore(pLock, flags);
+	PRINT_STATUS(0);
 	return 0;
 }
 
-static void dumTxTimeout (struct net_device *pDev)
+void dumTxTimeout (struct net_device *pDev)
 {
 	struct dumPriv_ *pPriv = netdev_priv(pDev);
 
@@ -507,8 +523,9 @@ static void dumTxTimeout (struct net_device *pDev)
 	return;
 }
 
-static struct net_device_stats *dumStats(struct net_device *pDev)
+struct net_device_stats *dumStats(struct net_device *pDev)
 {
+	// PDEBUG("getting device stats for %s", pDev->name);
 	struct dumPriv_ *pPriv = netdev_priv(pDev);
 	return &pPriv->stats;
 }
@@ -517,10 +534,11 @@ static struct net_device_stats *dumStats(struct net_device *pDev)
  * Header operations
  */
 
-static int dumHeader(struct sk_buff *pSkB, struct net_device *pDev, unsigned short type, 
+int dumHeader(struct sk_buff *pSkB, struct net_device *pDev, unsigned short type, 
 	const void *pDAddr, const void *pSAddr, unsigned len)
 {
-	struct ethhdr *pEth = (struct ethhdr *)skb_push(pSkB,ETH_HLEN);
+	// PDEBUG("build ethernet header for %s", pDev->name);
+	struct ethhdr *pEth = (struct ethhdr *)skb_push(pSkB, ETH_HLEN);
 
 	pEth->h_proto = htons(type);
 	memcpy(pEth->h_source, pSAddr ? pSAddr : pDev->dev_addr, pDev->addr_len);
@@ -543,18 +561,21 @@ static int dummyNetdevModuleInit(void)
 
 	// Allocate devices
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 17, 0))
-	dummyDevs[0] = alloc_netdev(sizeof (struct dumPriv_), "dummy%d", dumSetup);
-	dummyDevs[1] = alloc_netdev(sizeof (struct dumPriv_), "dummy%d", dumSetup);
+	dummyDevs[0] = alloc_netdev(sizeof (struct dumPriv_), "dm%d", dumSetup);
+	dummyDevs[1] = alloc_netdev(sizeof (struct dumPriv_), "dm%d", dumSetup);
 #else
-	dummyDevs[0] = alloc_netdev(sizeof (struct dumPriv_), "dummy%d", NET_NAME_UNKNOWN, dumSetup);
-	dummyDevs[1] = alloc_netdev(sizeof (struct dumPriv_), "dummy%d", NET_NAME_UNKNOWN, dumSetup);
+	dummyDevs[0] = alloc_netdev(sizeof (struct dumPriv_), "dm%d", NET_NAME_UNKNOWN, dumSetup);
+	dummyDevs[1] = alloc_netdev(sizeof (struct dumPriv_), "dm%d", NET_NAME_UNKNOWN, dumSetup);
 #endif
 	if (dummyDevs[0] == NULL || dummyDevs[1] == NULL)
 	{
 		err = -ENOMEM;
 		PRINT_STATUS_MSG("cannot allocate struct dummyNet_priv_ (err=%d)", err, err);
-		dumCleanup();
+		// dumCleanup();
 		return err;
+	} else {
+		for (i=0; i<sizeof dummyDevs/sizeof *dummyDevs; i++)
+			PDEBUG("dummyDevs[%i] allocated at 0x%p (%ld bytes)", i, dummyDevs[i], sizeof **dummyDevs);
 	}
 
 	// Register devices
@@ -562,8 +583,10 @@ static int dummyNetdevModuleInit(void)
 		if ((err = register_netdev(dummyDevs[i])) != 0)
 		{
 			PRINT_STATUS_MSG("cannot register net device (err=%d)", err, err);
-			dumCleanup();
+			// dumCleanup();
 			return err;
+		} else {
+			PDEBUG("dummyDevs[%i] successfully registered!", i);
 		}
 
 	PRINT_STATUS(err);
